@@ -1,12 +1,5 @@
-# app.py — DQ Sales Monitor (Databricks-ready)
-# - Overview ultra rápido (Valid vs Quarantine + impacto em vendas)
-# - Qualidade: lista COMPLETA de errors/warnings com contagem
-# - Insights extra: Sales vs Temperature/Fuel/Unemployment (bins simples)
-# - Chat sempre acessível no sidebar (toggle)
-# - Checks (Advanced) no fim, sem "detalhe" extra
-
+# app.py — DQ Sales Monitor (Databricks-ready) + Headline automático
 import json
-from datetime import datetime
 from typing import Optional
 
 import pandas as pd
@@ -20,13 +13,17 @@ import altair as alt
 # ----------------------------
 st.set_page_config(page_title="DQ Sales Monitor", page_icon="📊", layout="wide")
 
-GREEN = "#00E676"   # vivid green
-RED = "#FF1744"     # vivid red
-AMBER = "#FFB300"   # vivid amber
+GREEN = "#00E676"
+RED = "#FF1744"
+AMBER = "#FFB300"
 BORDER = "rgba(255,255,255,0.10)"
 PANEL_BG = "rgba(255,255,255,0.03)"
 
 alt.themes.enable("dark")
+
+VALID_TBL = "databricks_demos.sales_data.dqx_demo_walmart_valid_data"
+QUAR_TBL = "databricks_demos.sales_data.dqx_demo_walmart_quarantine_data"
+CHECKS_TBL = "databricks_demos.sales_data.dqx_demo_walmart_checks"
 
 
 # ----------------------------
@@ -80,6 +77,17 @@ st.markdown(
         padding: 14px 16px;
         background: rgba(255,255,255,0.02);
       }}
+
+      .headline {{
+        border: 1px solid {BORDER};
+        border-radius: 18px;
+        padding: 12px 14px;
+        background: rgba(255,255,255,0.04);
+        box-shadow: 0 10px 30px rgba(0,0,0,0.18);
+        font-size: 1.02rem;
+        line-height: 1.25;
+      }}
+      .headline b {{ font-weight: 900; }}
     </style>
     """,
     unsafe_allow_html=True
@@ -87,22 +95,14 @@ st.markdown(
 
 
 # ----------------------------
-# Databricks loaders
+# Load Databricks
 # ----------------------------
-VALID_TBL = "databricks_demos.sales_data.dqx_demo_walmart_valid_data"
-QUAR_TBL = "databricks_demos.sales_data.dqx_demo_walmart_quarantine_data"
-CHECKS_TBL = "databricks_demos.sales_data.dqx_demo_walmart_checks"
-
-
 @st.cache_data(show_spinner=False)
 def load_from_databricks() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    # Works if executed in Databricks / with SparkSession available
     from pyspark.sql import SparkSession  # type: ignore
-
     spark = SparkSession.getActiveSession()
     if spark is None:
-        raise RuntimeError("SparkSession not found. Executa isto dentro do Databricks ou num ambiente com Spark ativo.")
-
+        raise RuntimeError("SparkSession not found. Executa isto dentro do Databricks (ou com Spark ativo).")
     valid_df = spark.table(VALID_TBL).toPandas()
     quar_df = spark.table(QUAR_TBL).toPandas()
     checks_df = spark.table(CHECKS_TBL).toPandas()
@@ -137,11 +137,23 @@ def money_short(x: float) -> str:
     return f"${x:.0f}"
 
 
+def safe_datetime_col(df: pd.DataFrame, col: str = "Date") -> pd.DataFrame:
+    d = df.copy()
+    if col in d.columns:
+        d[col] = pd.to_datetime(d[col], errors="coerce")
+    return d
+
+
+def apply_filters(df: pd.DataFrame, start_date, end_date, selected_stores) -> pd.DataFrame:
+    d = safe_datetime_col(df, "Date")
+    if "Date" in d.columns:
+        d = d[(d["Date"].dt.date >= start_date) & (d["Date"].dt.date <= end_date)]
+    if selected_stores and "Store" in d.columns:
+        d = d[d["Store"].isin(selected_stores)]
+    return d
+
+
 def parse_issue_counts(series: pd.Series) -> pd.DataFrame:
-    """
-    Expects JSON like {"items":[{"name":"Fuel_Price_is_null",...}, ...]}
-    Databricks demo columns are usually "__errors" and "__warnings".
-    """
     counts = {}
     for x in series.dropna():
         try:
@@ -159,53 +171,41 @@ def parse_issue_counts(series: pd.Series) -> pd.DataFrame:
     return df
 
 
-def safe_datetime_col(df: pd.DataFrame, col: str = "Date") -> pd.DataFrame:
-    d = df.copy()
-    if col in d.columns:
-        d[col] = pd.to_datetime(d[col], errors="coerce")
-    return d
+def top_row(df: pd.DataFrame) -> tuple[Optional[str], int]:
+    if df is None or len(df) == 0:
+        return None, 0
+    r = df.iloc[0]
+    return str(r["Rule"]), int(r["Count"])
 
 
-def apply_filters(df: pd.DataFrame, start_date, end_date, selected_stores) -> pd.DataFrame:
-    d = safe_datetime_col(df, "Date")
-    if "Date" in d.columns:
-        d = d[(d["Date"].dt.date >= start_date) & (d["Date"].dt.date <= end_date)]
-    if selected_stores and "Store" in d.columns:
-        d = d[d["Store"].isin(selected_stores)]
-    return d
+def compute_store_quarantine_rate(valid_f: pd.DataFrame, quar_f: pd.DataFrame) -> Optional[tuple[int, float]]:
+    if "Store" not in valid_f.columns and "Store" not in quar_f.columns:
+        return None
 
+    v = valid_f[["Store"]].copy() if "Store" in valid_f.columns else pd.DataFrame({"Store": []})
+    q = quar_f[["Store"]].copy() if "Store" in quar_f.columns else pd.DataFrame({"Store": []})
 
-def binned_sales(df: pd.DataFrame, xcol: str, label: str, bins: int = 6) -> pd.DataFrame:
-    """
-    Produz 'bins' por quantis e calcula média de Weekly_Sales por bin.
-    Bom para Temperature/Fuel_Price/Unemployment sem complicar.
-    """
-    if len(df) == 0 or xcol not in df.columns or "Weekly_Sales" not in df.columns:
-        return pd.DataFrame(columns=["Bin", "AvgSales", "Set"])
+    v["Set"] = "Valid"
+    q["Set"] = "Quarantine"
+    base = pd.concat([v, q], ignore_index=True)
 
-    d = df[[xcol, "Weekly_Sales"]].copy()
-    d[xcol] = pd.to_numeric(d[xcol], errors="coerce")
-    d["Weekly_Sales"] = pd.to_numeric(d["Weekly_Sales"], errors="coerce")
-    d = d.dropna()
+    if len(base) == 0:
+        return None
 
-    if len(d) < 30:
-        # pouco dado => não inventar bins
-        return pd.DataFrame(columns=["Bin", "AvgSales", "Set"])
+    store_counts = base.groupby(["Store", "Set"], as_index=False).size().rename(columns={"size": "Count"})
+    pivot = store_counts.pivot_table(index="Store", columns="Set", values="Count", fill_value=0).reset_index()
+    pivot["Total"] = pivot.get("Valid", 0) + pivot.get("Quarantine", 0)
+    pivot["QuarantineRate"] = np.where(pivot["Total"] > 0, 100.0 * pivot.get("Quarantine", 0) / pivot["Total"], 0.0)
 
-    try:
-        d["Bin"] = pd.qcut(d[xcol], q=bins, duplicates="drop")
-    except Exception:
-        return pd.DataFrame(columns=["Bin", "AvgSales", "Set"])
+    if len(pivot) == 0:
+        return None
 
-    g = d.groupby("Bin", as_index=False)["Weekly_Sales"].mean()
-    g["Bin"] = g["Bin"].astype(str)
-    g = g.rename(columns={"Weekly_Sales": "AvgSales"})
-    g["Set"] = label
-    return g
+    worst = pivot.sort_values("QuarantineRate", ascending=False).iloc[0]
+    return int(worst["Store"]), float(worst["QuarantineRate"])
 
 
 # ----------------------------
-# UI Header
+# Header
 # ----------------------------
 st.markdown(
     f"""
@@ -219,19 +219,12 @@ st.markdown(
 
 
 # ----------------------------
-# Sidebar: Data + filters + Chat
+# Sidebar: filters + Chat
 # ----------------------------
 st.sidebar.header("⚙️ Controlo")
 
-data_mode = st.sidebar.radio("Fonte de dados", ["databricks"], index=0)
+valid_df, quar_df, checks_df = load_from_databricks()
 
-try:
-    valid_df, quar_df, checks_df = load_from_databricks()
-except Exception as e:
-    st.error(f"Erro a carregar Databricks: {e}")
-    st.stop()
-
-# unify for filters
 all_df = pd.concat([valid_df.assign(_set="Valid"), quar_df.assign(_set="Quarantine")], ignore_index=True)
 all_df = safe_datetime_col(all_df, "Date")
 
@@ -252,23 +245,18 @@ st.sidebar.divider()
 # Chat panel
 show_chat = st.sidebar.toggle("💬 Chat", value=True)
 if "chat_messages" not in st.session_state:
-    st.session_state.chat_messages = [
-        {"role": "assistant", "content": "Faz uma pergunta (ex.: 'quais as regras mais comuns em quarantine?')."}
-    ]
+    st.session_state.chat_messages = [{"role": "assistant", "content": "Faz uma pergunta (placeholder IA)."}]
 
 if show_chat:
     with st.sidebar.expander("💬 Chat", expanded=True):
         for m in st.session_state.chat_messages:
             with st.chat_message(m["role"]):
                 st.markdown(m["content"])
-
         user_msg = st.chat_input("Escreve aqui…")
         if user_msg:
             st.session_state.chat_messages.append({"role": "user", "content": user_msg})
             with st.chat_message("user"):
                 st.markdown(user_msg)
-
-            # Placeholder (limpo)
             reply = "Recebido. (placeholder: aqui ligas o teu motor de IA.)"
             st.session_state.chat_messages.append({"role": "assistant", "content": reply})
             with st.chat_message("assistant"):
@@ -282,13 +270,13 @@ quar_f = apply_filters(quar_df, start_date, end_date, selected_stores)
 # ----------------------------
 # Tabs
 # ----------------------------
-tab_overview, tab_sales, tab_quality, tab_insights, tab_checks = st.tabs(
-    ["⚡ Overview", "📈 Vendas", "✅ Qualidade", "🧠 Insights", "🧱 Checks (Advanced)"]
+tab_overview, tab_sales, tab_quality, tab_checks = st.tabs(
+    ["⚡ Overview", "📈 Vendas", "✅ Qualidade", "🧱 Checks (Advanced)"]
 )
 
 
 # ----------------------------
-# OVERVIEW (3 segundos)
+# OVERVIEW + HEADLINE automático
 # ----------------------------
 with tab_overview:
     total_valid = len(valid_f)
@@ -301,6 +289,42 @@ with tab_overview:
     sales_valid = float(pd.to_numeric(valid_f.get("Weekly_Sales", pd.Series(dtype="float")), errors="coerce").sum()) if total_valid else 0.0
     sales_quar = float(pd.to_numeric(quar_f.get("Weekly_Sales", pd.Series(dtype="float")), errors="coerce").sum()) if total_quar else 0.0
 
+    # --- Headline calc ---
+    err_col = "__errors" if "__errors" in quar_f.columns else "errors" if "errors" in quar_f.columns else None
+    warn_col = "__warnings" if "__warnings" in quar_f.columns else "warnings" if "warnings" in quar_f.columns else None
+
+    err_df = parse_issue_counts(quar_f[err_col]) if (len(quar_f) and err_col) else pd.DataFrame(columns=["Rule", "Count"])
+    warn_df = parse_issue_counts(quar_f[warn_col]) if (len(quar_f) and warn_col) else pd.DataFrame(columns=["Rule", "Count"])
+
+    top_err_name, top_err_count = top_row(err_df)
+    top_warn_name, top_warn_count = top_row(warn_df)
+    worst_store = compute_store_quarantine_rate(valid_f, quar_f)
+
+    if total_quar == 0:
+        headline_html = f"""
+        <div class="headline">
+          ✅ <b>OK</b> — 0% em <span class="pill pill-red">Quarantine</span>.
+        </div>
+        """
+    else:
+        store_part = ""
+        if worst_store:
+            store_id, store_rate = worst_store
+            store_part = f" • store mais afetada: <b>{store_id}</b> ({store_rate:.1f}%)"
+
+        err_part = f"principal erro: <b>{top_err_name}</b> ({top_err_count:,})".replace(",", ".") if top_err_name else "principal erro: <b>—</b>"
+        warn_part = f"principal warning: <b>{top_warn_name}</b> ({top_warn_count:,})".replace(",", ".") if top_warn_name else "principal warning: <b>—</b>"
+
+        headline_html = f"""
+        <div class="headline">
+          ⚠️ <b>Quarantine {pct_quar:.1f}%</b> — {err_part} • {warn_part}{store_part}
+        </div>
+        """
+
+    st.markdown(headline_html, unsafe_allow_html=True)
+    st.markdown("")
+
+    # KPI row
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
         kpi_card("Registos", f"{total:,}".replace(",", "."))
@@ -337,13 +361,9 @@ with tab_overview:
         st.altair_chart(donut, use_container_width=True)
 
     with right:
-        # Sales trend: Valid vs Quarantine
         if total:
             ts_all = (
-                pd.concat(
-                    [valid_f.assign(_set="Valid"), quar_f.assign(_set="Quarantine")],
-                    ignore_index=True
-                )
+                pd.concat([valid_f.assign(_set="Valid"), quar_f.assign(_set="Quarantine")], ignore_index=True)
                 .pipe(safe_datetime_col, "Date")
                 .groupby(["Date", "_set"], as_index=False)["Weekly_Sales"].sum()
                 .sort_values("Date")
@@ -368,54 +388,20 @@ with tab_overview:
         else:
             st.info("Sem dados para o filtro atual.")
 
-    # Estado + contagens
-    if total_quar == 0:
-        st.markdown(
-            f"""
-            <div class="panel">
-              <b>Estado:</b> <span class="pill pill-green">OK</span> — não existem registos em <span class="pill pill-red">Quarantine</span>.
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-    else:
-        err_col = "__errors" if "__errors" in quar_f.columns else "errors" if "errors" in quar_f.columns else None
-        warn_col = "__warnings" if "__warnings" in quar_f.columns else "warnings" if "warnings" in quar_f.columns else None
-
-        err_df = parse_issue_counts(quar_f[err_col]) if err_col else pd.DataFrame(columns=["Rule", "Count"])
-        warn_df = parse_issue_counts(quar_f[warn_col]) if warn_col else pd.DataFrame(columns=["Rule", "Count"])
-
-        err_total = int(err_df["Count"].sum()) if len(err_df) else 0
-        warn_total = int(warn_df["Count"].sum()) if len(warn_df) else 0
-
-        st.markdown(
-            f"""
-            <div class="panel">
-              <b>Estado:</b> <span class="pill pill-red">ATENÇÃO</span>
-              &nbsp;•&nbsp; Quarantine: <b>{pct_quar:.1f}%</b>
-              &nbsp;•&nbsp; Errors: <b style="color:{RED}">{err_total}</b>
-              &nbsp;•&nbsp; Warnings: <b style="color:{AMBER}">{warn_total}</b>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
 
 # ----------------------------
-# VENDAS (simples, mas útil)
+# VENDAS (mantém simples)
 # ----------------------------
 with tab_sales:
     st.subheader("📈 Vendas")
-    st.caption("Visão rápida: Top Stores (Valid) + impacto de feriados (Valid vs Quarantine).")
 
     if len(valid_f) == 0 and len(quar_f) == 0:
         st.warning("Sem dados para estes filtros.")
     else:
         colA, colB = st.columns([1.2, 1])
 
-        # Top Stores (Valid)
         with colA:
-            if len(valid_f):
+            if len(valid_f) and "Store" in valid_f.columns:
                 top = (
                     valid_f.groupby("Store", as_index=False)["Weekly_Sales"]
                     .sum()
@@ -437,10 +423,9 @@ with tab_sales:
             else:
                 st.info("Sem dados Valid para Top Stores.")
 
-        # Holiday impact (Valid vs Quarantine)
         with colB:
             def holiday_avg(df: pd.DataFrame, label: str) -> pd.DataFrame:
-                if len(df) == 0:
+                if len(df) == 0 or "Weekly_Sales" not in df.columns:
                     return pd.DataFrame(columns=["Holiday", "Avg", "Set"])
                 d = df.copy()
                 d["Holiday_Flag"] = pd.to_numeric(d.get("Holiday_Flag"), errors="coerce").fillna(0)
@@ -474,11 +459,10 @@ with tab_sales:
 
 
 # ----------------------------
-# QUALIDADE (completo, mas direto)
+# QUALIDADE (completo)
 # ----------------------------
 with tab_quality:
     st.subheader("✅ Qualidade")
-    st.caption("Regras completas + contagens. E uma visão rápida de onde (stores) está a concentrar a quarentena.")
 
     if len(quar_f) == 0:
         st.markdown(
@@ -508,34 +492,6 @@ with tab_quality:
             kpi_card("Total Warnings", f"{warn_total:,}".replace(",", "."), color=AMBER)
 
         st.markdown("")
-
-        # Quarantine rate por Store (rápido para empresa perceber "onde dói")
-        if "Store" in all_df.columns:
-            base = pd.concat(
-                [
-                    valid_f[["Store"]].assign(Set="Valid"),
-                    quar_f[["Store"]].assign(Set="Quarantine"),
-                ],
-                ignore_index=True
-            )
-            store_counts = base.groupby(["Store", "Set"], as_index=False).size().rename(columns={"size": "Count"})
-            pivot = store_counts.pivot_table(index="Store", columns="Set", values="Count", fill_value=0).reset_index()
-            pivot["Total"] = pivot.get("Valid", 0) + pivot.get("Quarantine", 0)
-            pivot["QuarantineRate"] = np.where(pivot["Total"] > 0, 100.0 * pivot.get("Quarantine", 0) / pivot["Total"], 0.0)
-            top_q = pivot.sort_values("QuarantineRate", ascending=False).head(12)
-
-            rate_chart = (
-                alt.Chart(top_q)
-                .mark_bar()
-                .encode(
-                    x=alt.X("QuarantineRate:Q", title="Quarantine rate (%)"),
-                    y=alt.Y("Store:N", sort="-x", title="Stores"),
-                    color=alt.value(RED),
-                    tooltip=["Store:N", alt.Tooltip("QuarantineRate:Q", format=".1f"), "Total:Q"],
-                )
-                .properties(height=360, title="Stores com maior % em Quarantine")
-            )
-            st.altair_chart(rate_chart, use_container_width=True)
 
         c1, c2 = st.columns(2)
         with c1:
@@ -585,63 +541,7 @@ with tab_quality:
 
 
 # ----------------------------
-# INSIGHTS (os gráficos extra que mencionaste)
-# ----------------------------
-with tab_insights:
-    st.subheader("🧠 Insights")
-    st.caption("Gráficos úteis, mas sem complicar: vendas vs temperatura / gasolina / desemprego.")
-
-    if len(valid_f) == 0 and len(quar_f) == 0:
-        st.warning("Sem dados para estes filtros.")
-    else:
-        # Temperature bins
-        temp_valid = binned_sales(valid_f, "Temperature", "Valid", bins=6)
-        temp_quar = binned_sales(quar_f, "Temperature", "Quarantine", bins=6)
-        temp_all = pd.concat([temp_valid, temp_quar], ignore_index=True)
-
-        # Fuel bins
-        fuel_valid = binned_sales(valid_f, "Fuel_Price", "Valid", bins=6)
-        fuel_quar = binned_sales(quar_f, "Fuel_Price", "Quarantine", bins=6)
-        fuel_all = pd.concat([fuel_valid, fuel_quar], ignore_index=True)
-
-        # Unemployment bins
-        un_valid = binned_sales(valid_f, "Unemployment", "Valid", bins=6)
-        un_quar = binned_sales(quar_f, "Unemployment", "Quarantine", bins=6)
-        un_all = pd.concat([un_valid, un_quar], ignore_index=True)
-
-        def bin_chart(df: pd.DataFrame, title: str):
-            if len(df) == 0:
-                return None
-            return (
-                alt.Chart(df)
-                .mark_line(point=True, strokeWidth=4)
-                .encode(
-                    x=alt.X("Bin:N", title="", sort=None),
-                    y=alt.Y("AvgSales:Q", title="Média Weekly Sales"),
-                    color=alt.Color(
-                        "Set:N",
-                        scale=alt.Scale(domain=["Valid", "Quarantine"], range=[GREEN, RED]),
-                        legend=alt.Legend(title="", orient="bottom"),
-                    ),
-                    tooltip=["Set:N", "Bin:N", alt.Tooltip("AvgSales:Q", format=",.0f")],
-                )
-                .properties(height=360, title=title)
-            )
-
-        a, b = st.columns(2)
-        with a:
-            ch = bin_chart(temp_all, "Vendas vs Temperatura (bins)")
-            st.altair_chart(ch, use_container_width=True) if ch else st.info("Sem dados suficientes para Temperatura.")
-        with b:
-            ch = bin_chart(fuel_all, "Vendas vs Preço Gasolina (bins)")
-            st.altair_chart(ch, use_container_width=True) if ch else st.info("Sem dados suficientes para Fuel_Price.")
-
-        ch = bin_chart(un_all, "Vendas vs Desemprego (bins)")
-        st.altair_chart(ch, use_container_width=True) if ch else st.info("Sem dados suficientes para Unemployment.")
-
-
-# ----------------------------
-# CHECKS (Advanced) — no fim, sem “detalhe”
+# CHECKS (Advanced) — no fim, sem detalhe extra
 # ----------------------------
 with tab_checks:
     st.subheader("🧱 Checks (Advanced)")
