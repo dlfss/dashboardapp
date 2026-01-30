@@ -1,7 +1,11 @@
 # app.py
-# DQ Sales Monitor — comparação Valid vs Quarantine SIDE-BY-SIDE (sem sobrepor linhas/barras)
-# + Insights por zonas (Baixa/Média/Alta) com painéis lado a lado
-# + mantém fallback mock/databricks para não dar erro no Streamlit Cloud
+# DQ Sales Monitor — Visual "3 segundos"
+# - Valid vs Quarantine: SEM sobrepor barras (barras agrupadas lado-a-lado no mesmo gráfico)
+# - Trend: linhas com dash (comparação sem tapar)
+# - Insights: Temperature/Fuel/Unemployment/CPI por Zonas (Baixa/Média/Alta) com barras agrupadas
+# - Chat acessível no sidebar (toggle + expander)
+# - Checks por último (sem detalhe extra)
+# - Databricks mode tenta Spark; se falhar, cai para mock (sem crash no Streamlit Cloud)
 
 import json
 from datetime import datetime, timedelta
@@ -17,9 +21,9 @@ import altair as alt
 # ----------------------------
 st.set_page_config(page_title="DQ Sales Monitor", page_icon="📊", layout="wide")
 
-GREEN = "#00E676"
-RED = "#FF1744"
-AMBER = "#FFB300"
+GREEN = "#00E676"   # vivid green
+RED = "#FF1744"     # vivid red
+AMBER = "#FFB300"   # vivid amber
 
 alt.themes.enable("dark")
 
@@ -232,7 +236,7 @@ def load_data(mode: str):
     if mode == "mock":
         return checks, valid_df, quarantine_df
 
-    # Try Spark if in Databricks; fallback silently.
+    # Try Spark if in Databricks; fallback silently (no crash on Streamlit Cloud)
     try:
         from pyspark.sql import SparkSession  # type: ignore
         spark = SparkSession.getActiveSession()
@@ -290,8 +294,20 @@ def kpi_card(label: str, value: str, delta: str | None = None, color: str | None
     )
 
 
-# --- Zonas: Baixa/Média/Alta (sem intervalos)
-def zone_bins(df: pd.DataFrame, xcol: str, label: str) -> pd.DataFrame:
+def base_altair_style(chart):
+    return (
+        chart.configure_view(strokeOpacity=0)
+        .configure_axis(
+            labelColor="rgba(255,255,255,0.80)",
+            titleColor="rgba(255,255,255,0.85)",
+            gridColor="rgba(255,255,255,0.08)"
+        )
+        .configure_legend(labelColor="rgba(255,255,255,0.85)")
+    )
+
+
+# --- Zonas: Baixa/Média/Alta (tercis)
+def zone_bins(df: pd.DataFrame, xcol: str, set_label: str) -> pd.DataFrame:
     if len(df) == 0 or xcol not in df.columns or "Weekly_Sales" not in df.columns:
         return pd.DataFrame(columns=["Zona", "AvgSales", "Set"])
 
@@ -299,7 +315,6 @@ def zone_bins(df: pd.DataFrame, xcol: str, label: str) -> pd.DataFrame:
     d[xcol] = pd.to_numeric(d[xcol], errors="coerce")
     d["Weekly_Sales"] = pd.to_numeric(d["Weekly_Sales"], errors="coerce")
     d = d.dropna()
-
     if len(d) < 50:
         return pd.DataFrame(columns=["Zona", "AvgSales", "Set"])
 
@@ -310,73 +325,102 @@ def zone_bins(df: pd.DataFrame, xcol: str, label: str) -> pd.DataFrame:
 
     g = d.groupby("Zona", as_index=False)["Weekly_Sales"].mean()
     g = g.rename(columns={"Weekly_Sales": "AvgSales"})
-    g["Set"] = label
+    g["Set"] = set_label
     g["Zona"] = pd.Categorical(g["Zona"], categories=["Baixa", "Média", "Alta"], ordered=True)
-    g = g.sort_values("Zona")
+    g["Set"] = pd.Categorical(g["Set"], categories=["Valid", "Quarantine"], ordered=True)
     return g
 
 
-def small_zone_bar(df: pd.DataFrame, title: str, set_label: str):
-    """Um painel (Valid OU Quarantine) — simples e comparável."""
-    if len(df) == 0:
-        return alt.Chart(pd.DataFrame({"msg": ["Sem dados"]})).mark_text(size=14).encode(text="msg:N").properties(height=240, title=title)
+def grouped_zone_chart(valid_zone: pd.DataFrame, quar_zone: pd.DataFrame, title: str):
+    data = pd.concat([valid_zone, quar_zone], ignore_index=True)
+    if len(data) == 0:
+        return alt.Chart(pd.DataFrame({"msg": ["Sem dados"]})).mark_text(size=14).encode(text="msg:N").properties(height=360, title=title)
 
-    color = GREEN if set_label == "Valid" else RED
-    return (
-        alt.Chart(df)
-        .mark_bar()
+    data["Zona"] = pd.Categorical(data["Zona"], categories=["Baixa", "Média", "Alta"], ordered=True)
+    data["Set"] = pd.Categorical(data["Set"], categories=["Valid", "Quarantine"], ordered=True)
+
+    chart = (
+        alt.Chart(data)
+        .mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6)
         .encode(
             x=alt.X("Zona:N", sort=["Baixa", "Média", "Alta"], title=""),
+            xOffset=alt.XOffset("Set:N"),  # ✅ barras lado a lado (estilo desenho)
             y=alt.Y("AvgSales:Q", title="Média Weekly Sales"),
-            color=alt.value(color),
-            tooltip=["Zona:N", alt.Tooltip("AvgSales:Q", format=",.0f")],
+            color=alt.Color(
+                "Set:N",
+                scale=alt.Scale(domain=["Valid", "Quarantine"], range=[GREEN, RED]),
+                legend=alt.Legend(title="", orient="bottom"),
+            ),
+            tooltip=["Set:N", "Zona:N", alt.Tooltip("AvgSales:Q", format=",.0f")],
         )
-        .properties(height=300, title=title)
+        .properties(height=360, title=title)
     )
+    return base_altair_style(chart)
 
 
-def side_by_side_zone(valid_df: pd.DataFrame, quar_df: pd.DataFrame, title: str):
-    """2 painéis lado a lado (Valid vs Quarantine), com escala Y igual."""
-    v = valid_df.copy()
-    q = quar_df.copy()
+def grouped_holiday_chart(valid_df: pd.DataFrame, quar_df: pd.DataFrame, title: str):
+    def holiday_avg(df: pd.DataFrame, set_label: str) -> pd.DataFrame:
+        if len(df) == 0:
+            return pd.DataFrame(columns=["Holiday", "AvgSales", "Set"])
+        d = df.copy()
+        d["Holiday_Flag"] = pd.to_numeric(d.get("Holiday_Flag"), errors="coerce").fillna(0)
+        g = d.groupby("Holiday_Flag", as_index=False)["Weekly_Sales"].mean()
+        g["Holiday"] = g["Holiday_Flag"].map({0: "Sem feriado", 1: "Com feriado"}).fillna("Outro")
+        g = g.rename(columns={"Weekly_Sales": "AvgSales"})
+        g["Set"] = set_label
+        return g[["Holiday", "AvgSales", "Set"]]
 
-    # Se ambos vazios
-    if len(v) == 0 and len(q) == 0:
-        return alt.Chart(pd.DataFrame({"msg": ["Sem dados"]})).mark_text(size=14).encode(text="msg:N").properties(height=240, title=title)
+    data = pd.concat([holiday_avg(valid_df, "Valid"), holiday_avg(quar_df, "Quarantine")], ignore_index=True)
+    if len(data) == 0:
+        return alt.Chart(pd.DataFrame({"msg": ["Sem dados"]})).mark_text(size=14).encode(text="msg:N").properties(height=360, title=title)
 
-    # Domínio Y comum
-    max_y = 0.0
-    if len(v): max_y = max(max_y, float(v["AvgSales"].max()))
-    if len(q): max_y = max(max_y, float(q["AvgSales"].max()))
-    max_y = max_y * 1.05 if max_y > 0 else 1
+    data["Set"] = pd.Categorical(data["Set"], categories=["Valid", "Quarantine"], ordered=True)
 
-    v_chart = small_zone_bar(v, "Valid", "Valid").encode(y=alt.Y("AvgSales:Q", scale=alt.Scale(domain=[0, max_y])))
-    q_chart = small_zone_bar(q, "Quarantine", "Quarantine").encode(y=alt.Y("AvgSales:Q", scale=alt.Scale(domain=[0, max_y])))
-
-    return alt.hconcat(v_chart, q_chart).resolve_scale(y="shared").properties(title=title)
-
-
-def sales_trend(df: pd.DataFrame, set_label: str):
-    color = GREEN if set_label == "Valid" else RED
-    if len(df) == 0:
-        return alt.Chart(pd.DataFrame({"msg": ["Sem dados"]})).mark_text(size=14).encode(text="msg:N").properties(height=300, title=set_label)
-
-    ts = (
-        df.assign(Date=pd.to_datetime(df["Date"], errors="coerce"))
-        .groupby("Date", as_index=False)["Weekly_Sales"].sum()
-        .sort_values("Date")
+    chart = (
+        alt.Chart(data)
+        .mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6)
+        .encode(
+            x=alt.X("Holiday:N", title=""),
+            xOffset=alt.XOffset("Set:N"),
+            y=alt.Y("AvgSales:Q", title="Média Weekly Sales"),
+            color=alt.Color(
+                "Set:N",
+                scale=alt.Scale(domain=["Valid", "Quarantine"], range=[GREEN, RED]),
+                legend=alt.Legend(title="", orient="bottom"),
+            ),
+            tooltip=["Set:N", "Holiday:N", alt.Tooltip("AvgSales:Q", format=",.0f")],
+        )
+        .properties(height=360, title=title)
     )
-    return (
+    return base_altair_style(chart)
+
+
+def trend_chart(valid_df: pd.DataFrame, quar_df: pd.DataFrame, title: str):
+    data = pd.concat([valid_df.assign(Set="Valid"), quar_df.assign(Set="Quarantine")], ignore_index=True)
+    if len(data) == 0:
+        return alt.Chart(pd.DataFrame({"msg": ["Sem dados"]})).mark_text(size=14).encode(text="msg:N").properties(height=340, title=title)
+
+    data["Date"] = pd.to_datetime(data["Date"], errors="coerce")
+    ts = data.groupby(["Date", "Set"], as_index=False)["Weekly_Sales"].sum().sort_values("Date")
+    ts["Set"] = pd.Categorical(ts["Set"], categories=["Valid", "Quarantine"], ordered=True)
+
+    chart = (
         alt.Chart(ts)
         .mark_line(strokeWidth=5)
         .encode(
             x=alt.X("Date:T", title=""),
             y=alt.Y("Weekly_Sales:Q", title="Weekly Sales (soma)"),
-            color=alt.value(color),
-            tooltip=["Date:T", alt.Tooltip("Weekly_Sales:Q", format=",.0f")],
+            color=alt.Color(
+                "Set:N",
+                scale=alt.Scale(domain=["Valid", "Quarantine"], range=[GREEN, RED]),
+                legend=alt.Legend(title="", orient="bottom"),
+            ),
+            strokeDash=alt.StrokeDash("Set:N"),  # ✅ diferencia sem “taparem-se”
+            tooltip=["Date:T", "Set:N", alt.Tooltip("Weekly_Sales:Q", format=",.0f")],
         )
-        .properties(height=300, title=set_label)
+        .properties(height=340, title=title)
     )
+    return base_altair_style(chart)
 
 
 # ----------------------------
@@ -418,7 +462,7 @@ selected_stores = st.sidebar.multiselect("Store (opcional)", store_options, defa
 
 st.sidebar.divider()
 
-# Chat sempre acessível
+# Chat acessível em qualquer tab
 show_chat = st.sidebar.toggle("💬 Chat", value=True)
 if "chat_messages" not in st.session_state:
     st.session_state.chat_messages = [{"role": "assistant", "content": "Faz uma pergunta (placeholder IA)."}]
@@ -465,7 +509,6 @@ with tab_overview:
     total_sales_valid = float(pd.to_numeric(valid_f["Weekly_Sales"], errors="coerce").sum()) if total_valid else 0.0
     total_sales_quar = float(pd.to_numeric(quar_f["Weekly_Sales"], errors="coerce").sum()) if total_quar else 0.0
 
-    # KPI row
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
         kpi_card("Registos", f"{total:,}".replace(",", "."))
@@ -482,7 +525,6 @@ with tab_overview:
 
     left, right = st.columns([1, 1])
 
-    # Donut
     donut_df = pd.DataFrame({"Status": ["Valid", "Quarantine"], "Count": [total_valid, total_quar]})
     donut = (
         alt.Chart(donut_df)
@@ -498,15 +540,9 @@ with tab_overview:
         )
         .properties(height=340, title="Qualidade dos dados")
     )
-    with left:
-        st.altair_chart(donut, use_container_width=True)
+    left.altair_chart(base_altair_style(donut), use_container_width=True)
 
-    # Trend SIDE-BY-SIDE (não sobreposto)
-    with right:
-        v_line = sales_trend(valid_f, "Valid")
-        q_line = sales_trend(quar_f, "Quarantine")
-        # mesma escala Y para comparar
-        st.altair_chart(alt.hconcat(v_line, q_line).resolve_scale(y="shared").properties(title="Vendas semanais (comparação)"), use_container_width=True)
+    right.altair_chart(trend_chart(valid_f, quar_f, "Vendas semanais (Valid vs Quarantine)"), use_container_width=True)
 
 
 # ----------------------------
@@ -514,14 +550,13 @@ with tab_overview:
 # ----------------------------
 with tab_sales:
     st.subheader("📈 Vendas")
-    st.caption("Comparação rápida, sem sobrepor séries.")
+    st.caption("Top Stores + comparação por feriado (barras lado a lado).")
 
     if len(valid_f) == 0 and len(quar_f) == 0:
         st.warning("Sem dados para estes filtros.")
     else:
         colA, colB = st.columns([1.2, 1])
 
-        # Top Stores (Valid)
         with colA:
             if len(valid_f):
                 top = (
@@ -532,7 +567,7 @@ with tab_sales:
                 )
                 bar = (
                     alt.Chart(top)
-                    .mark_bar()
+                    .mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6)
                     .encode(
                         x=alt.X("Weekly_Sales:Q", title="Weekly Sales (soma)"),
                         y=alt.Y("Store:N", sort="-x", title="Top Stores (Valid)"),
@@ -541,55 +576,12 @@ with tab_sales:
                     )
                     .properties(height=420, title="Top Stores (Valid)")
                 )
-                st.altair_chart(bar, use_container_width=True)
+                st.altair_chart(base_altair_style(bar), use_container_width=True)
             else:
                 st.info("Sem dados Valid.")
 
-        # Holiday impact SIDE-BY-SIDE
         with colB:
-            def holiday_avg(df: pd.DataFrame) -> pd.DataFrame:
-                if len(df) == 0:
-                    return pd.DataFrame(columns=["Holiday", "AvgSales"])
-                d = df.copy()
-                d["Holiday_Flag"] = pd.to_numeric(d.get("Holiday_Flag"), errors="coerce").fillna(0)
-                g = d.groupby("Holiday_Flag", as_index=False)["Weekly_Sales"].mean()
-                g["Holiday"] = g["Holiday_Flag"].map({0: "Sem feriado", 1: "Com feriado"}).fillna("Outro")
-                g = g.rename(columns={"Weekly_Sales": "AvgSales"})
-                return g[["Holiday", "AvgSales"]]
-
-            v_h = holiday_avg(valid_f)
-            q_h = holiday_avg(quar_f)
-
-            max_y = 0.0
-            if len(v_h): max_y = max(max_y, float(v_h["AvgSales"].max()))
-            if len(q_h): max_y = max(max_y, float(q_h["AvgSales"].max()))
-            max_y = max_y * 1.05 if max_y > 0 else 1
-
-            v_chart = (
-                alt.Chart(v_h if len(v_h) else pd.DataFrame({"Holiday": ["Sem dados"], "AvgSales": [0]}))
-                .mark_bar()
-                .encode(
-                    x=alt.X("Holiday:N", title=""),
-                    y=alt.Y("AvgSales:Q", title="Média Weekly Sales", scale=alt.Scale(domain=[0, max_y])),
-                    color=alt.value(GREEN),
-                    tooltip=["Holiday:N", alt.Tooltip("AvgSales:Q", format=",.0f")],
-                )
-                .properties(height=300, title="Valid")
-            )
-
-            q_chart = (
-                alt.Chart(q_h if len(q_h) else pd.DataFrame({"Holiday": ["Sem dados"], "AvgSales": [0]}))
-                .mark_bar()
-                .encode(
-                    x=alt.X("Holiday:N", title=""),
-                    y=alt.Y("AvgSales:Q", title="Média Weekly Sales", scale=alt.Scale(domain=[0, max_y])),
-                    color=alt.value(RED),
-                    tooltip=["Holiday:N", alt.Tooltip("AvgSales:Q", format=",.0f")],
-                )
-                .properties(height=300, title="Quarantine")
-            )
-
-            st.altair_chart(alt.hconcat(v_chart, q_chart).resolve_scale(y="shared").properties(title="Feriado: média de vendas (comparação)"), use_container_width=True)
+            st.altair_chart(grouped_holiday_chart(valid_f, quar_f, "Feriado: média de vendas (Valid vs Quarantine)"), use_container_width=True)
 
 
 # ----------------------------
@@ -611,7 +603,7 @@ with tab_quality:
             if len(err_df):
                 chart = (
                     alt.Chart(err_df)
-                    .mark_bar()
+                    .mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6)
                     .encode(
                         x=alt.X("Ocorrências:Q", title=""),
                         y=alt.Y("Regra:N", sort="-x", title=""),
@@ -620,7 +612,7 @@ with tab_quality:
                     )
                     .properties(height=420)
                 )
-                st.altair_chart(chart, use_container_width=True)
+                st.altair_chart(base_altair_style(chart), use_container_width=True)
                 st.dataframe(err_df, use_container_width=True, hide_index=True)
             else:
                 st.info("Sem errors parseáveis.")
@@ -630,7 +622,7 @@ with tab_quality:
             if len(warn_df):
                 chart = (
                     alt.Chart(warn_df)
-                    .mark_bar()
+                    .mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6)
                     .encode(
                         x=alt.X("Ocorrências:Q", title=""),
                         y=alt.Y("Regra:N", sort="-x", title=""),
@@ -639,7 +631,7 @@ with tab_quality:
                     )
                     .properties(height=420)
                 )
-                st.altair_chart(chart, use_container_width=True)
+                st.altair_chart(base_altair_style(chart), use_container_width=True)
                 st.dataframe(warn_df, use_container_width=True, hide_index=True)
             else:
                 st.info("Sem warnings parseáveis.")
@@ -651,34 +643,30 @@ with tab_quality:
 
 
 # ----------------------------
-# INSIGHTS — SIDE-BY-SIDE
+# INSIGHTS (barras agrupadas no mesmo gráfico)
 # ----------------------------
 with tab_insights:
     st.subheader("🧠 Insights")
-    st.caption("Vendas por zonas (Baixa / Média / Alta) — comparação lado a lado.")
+    st.caption("Zonas Baixa / Média / Alta — barras lado a lado (Valid vs Quarantine).")
 
     if len(valid_f) == 0 and len(quar_f) == 0:
         st.warning("Sem dados para estes filtros.")
     else:
-        # Temperature
         v = zone_bins(valid_f, "Temperature", "Valid")
         q = zone_bins(quar_f, "Temperature", "Quarantine")
-        st.altair_chart(side_by_side_zone(v, q, "Vendas vs Temperatura (zonas)"), use_container_width=True)
+        st.altair_chart(grouped_zone_chart(v, q, "Vendas vs Temperatura (zonas)"), use_container_width=True)
 
-        # Fuel
         v = zone_bins(valid_f, "Fuel_Price", "Valid")
         q = zone_bins(quar_f, "Fuel_Price", "Quarantine")
-        st.altair_chart(side_by_side_zone(v, q, "Vendas vs Preço do Combustível (zonas)"), use_container_width=True)
+        st.altair_chart(grouped_zone_chart(v, q, "Vendas vs Preço do Combustível (zonas)"), use_container_width=True)
 
-        # Unemployment
         v = zone_bins(valid_f, "Unemployment", "Valid")
         q = zone_bins(quar_f, "Unemployment", "Quarantine")
-        st.altair_chart(side_by_side_zone(v, q, "Vendas vs Unemployment (zonas)"), use_container_width=True)
+        st.altair_chart(grouped_zone_chart(v, q, "Vendas vs Unemployment (zonas)"), use_container_width=True)
 
-        # CPI
         v = zone_bins(valid_f, "CPI", "Valid")
         q = zone_bins(quar_f, "CPI", "Quarantine")
-        st.altair_chart(side_by_side_zone(v, q, "Vendas vs CPI (zonas)"), use_container_width=True)
+        st.altair_chart(grouped_zone_chart(v, q, "Vendas vs CPI (zonas)"), use_container_width=True)
 
 
 # ----------------------------
