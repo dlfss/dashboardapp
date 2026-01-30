@@ -1,11 +1,12 @@
 # app.py
 # DQ Sales Monitor — Visual "3 segundos"
-# - Valid vs Quarantine: SEM sobrepor barras (barras agrupadas lado-a-lado no mesmo gráfico)
+# - BARRAS AGRUPADAS (Valid vs Quarantine lado-a-lado no mesmo gráfico)
+# - INSIGHTS: Temperature/Fuel/Unemployment/CPI por Zonas (Baixa/Média/Alta) com fallback robusto
 # - Trend: linhas com dash (comparação sem tapar)
-# - Insights: Temperature/Fuel/Unemployment/CPI por Zonas (Baixa/Média/Alta) com barras agrupadas
+# - Qualidade: mostra todos errors e warnings + contagem
 # - Chat acessível no sidebar (toggle + expander)
 # - Checks por último (sem detalhe extra)
-# - Databricks mode tenta Spark; se falhar, cai para mock (sem crash no Streamlit Cloud)
+# - Databricks mode tenta Spark; se falhar, cai para mock (não crash no Streamlit Cloud)
 
 import json
 from datetime import datetime, timedelta
@@ -36,7 +37,6 @@ st.markdown(
     <style>
       .block-container {{ padding-top: 1.1rem; padding-bottom: 2rem; }}
       h1, h2, h3 {{ letter-spacing: -0.02em; }}
-      .small-note {{ color: rgba(255,255,255,0.65); font-size: 0.9rem; }}
 
       .kpi {{
         border: 1px solid rgba(255,255,255,0.10);
@@ -236,7 +236,6 @@ def load_data(mode: str):
     if mode == "mock":
         return checks, valid_df, quarantine_df
 
-    # Try Spark if in Databricks; fallback silently (no crash on Streamlit Cloud)
     try:
         from pyspark.sql import SparkSession  # type: ignore
         spark = SparkSession.getActiveSession()
@@ -248,6 +247,7 @@ def load_data(mode: str):
         quarantine_df = spark.table("databricks_demos.sales_data.dqx_demo_walmart_quarantine_data").toPandas()
         return checks, valid_df, quarantine_df
     except Exception:
+        # fallback sem crash
         return checks, valid_df, quarantine_df
 
 
@@ -306,8 +306,16 @@ def base_altair_style(chart):
     )
 
 
-# --- Zonas: Baixa/Média/Alta (tercis)
+# ----------------------------
+# ROBUST ZONES + GUARANTEE BOTH SERIES
+# ----------------------------
 def zone_bins(df: pd.DataFrame, xcol: str, set_label: str) -> pd.DataFrame:
+    """
+    Zonas Baixa/Média/Alta com fallback.
+    - Tenta qcut (tercis).
+    - Se falhar, usa bins por quantis simples.
+    - Não bloqueia com len(d)<50 (para não "matar" o Valid com filtros).
+    """
     if len(df) == 0 or xcol not in df.columns or "Weekly_Sales" not in df.columns:
         return pd.DataFrame(columns=["Zona", "AvgSales", "Set"])
 
@@ -315,13 +323,29 @@ def zone_bins(df: pd.DataFrame, xcol: str, set_label: str) -> pd.DataFrame:
     d[xcol] = pd.to_numeric(d[xcol], errors="coerce")
     d["Weekly_Sales"] = pd.to_numeric(d["Weekly_Sales"], errors="coerce")
     d = d.dropna()
-    if len(d) < 50:
+
+    if len(d) < 5:
         return pd.DataFrame(columns=["Zona", "AvgSales", "Set"])
 
+    # 1) tenta qcut
     try:
         d["Zona"] = pd.qcut(d[xcol], q=3, labels=["Baixa", "Média", "Alta"], duplicates="drop")
     except Exception:
-        return pd.DataFrame(columns=["Zona", "AvgSales", "Set"])
+        d["Zona"] = None
+
+    # 2) fallback: quantis simples
+    if d["Zona"].isna().all():
+        q1 = d[xcol].quantile(0.33)
+        q2 = d[xcol].quantile(0.66)
+
+        def _zone(v):
+            if v <= q1:
+                return "Baixa"
+            if v <= q2:
+                return "Média"
+            return "Alta"
+
+        d["Zona"] = d[xcol].apply(_zone)
 
     g = d.groupby("Zona", as_index=False)["Weekly_Sales"].mean()
     g = g.rename(columns={"Weekly_Sales": "AvgSales"})
@@ -332,9 +356,20 @@ def zone_bins(df: pd.DataFrame, xcol: str, set_label: str) -> pd.DataFrame:
 
 
 def grouped_zone_chart(valid_zone: pd.DataFrame, quar_zone: pd.DataFrame, title: str):
-    data = pd.concat([valid_zone, quar_zone], ignore_index=True)
-    if len(data) == 0:
-        return alt.Chart(pd.DataFrame({"msg": ["Sem dados"]})).mark_text(size=14).encode(text="msg:N").properties(height=360, title=title)
+    """
+    Gráfico único com barras agrupadas.
+    GARANTE que aparecem sempre as duas séries (Valid/Quarantine) e as 3 zonas.
+    """
+    # Template garante layout/legend sempre consistentes
+    template = pd.DataFrame(
+        [(z, s, np.nan) for z in ["Baixa", "Média", "Alta"] for s in ["Valid", "Quarantine"]],
+        columns=["Zona", "Set", "AvgSales"]
+    )
+
+    data = pd.concat([template, valid_zone, quar_zone], ignore_index=True)
+
+    # agrega para ter 1 valor por (Zona, Set)
+    data = data.groupby(["Zona", "Set"], as_index=False)["AvgSales"].mean()
 
     data["Zona"] = pd.Categorical(data["Zona"], categories=["Baixa", "Média", "Alta"], ordered=True)
     data["Set"] = pd.Categorical(data["Set"], categories=["Valid", "Quarantine"], ordered=True)
@@ -344,7 +379,7 @@ def grouped_zone_chart(valid_zone: pd.DataFrame, quar_zone: pd.DataFrame, title:
         .mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6)
         .encode(
             x=alt.X("Zona:N", sort=["Baixa", "Média", "Alta"], title=""),
-            xOffset=alt.XOffset("Set:N"),  # ✅ barras lado a lado (estilo desenho)
+            xOffset=alt.XOffset("Set:N"),
             y=alt.Y("AvgSales:Q", title="Média Weekly Sales"),
             color=alt.Color(
                 "Set:N",
@@ -415,7 +450,7 @@ def trend_chart(valid_df: pd.DataFrame, quar_df: pd.DataFrame, title: str):
                 scale=alt.Scale(domain=["Valid", "Quarantine"], range=[GREEN, RED]),
                 legend=alt.Legend(title="", orient="bottom"),
             ),
-            strokeDash=alt.StrokeDash("Set:N"),  # ✅ diferencia sem “taparem-se”
+            strokeDash=alt.StrokeDash("Set:N"),
             tooltip=["Date:T", "Set:N", alt.Tooltip("Weekly_Sales:Q", format=",.0f")],
         )
         .properties(height=340, title=title)
@@ -550,7 +585,7 @@ with tab_overview:
 # ----------------------------
 with tab_sales:
     st.subheader("📈 Vendas")
-    st.caption("Top Stores + comparação por feriado (barras lado a lado).")
+    st.caption("Top Stores (Valid) + comparação por feriado (Valid vs Quarantine).")
 
     if len(valid_f) == 0 and len(quar_f) == 0:
         st.warning("Sem dados para estes filtros.")
@@ -643,7 +678,7 @@ with tab_quality:
 
 
 # ----------------------------
-# INSIGHTS (barras agrupadas no mesmo gráfico)
+# INSIGHTS (barras agrupadas no mesmo gráfico) + VALID GARANTIDO
 # ----------------------------
 with tab_insights:
     st.subheader("🧠 Insights")
