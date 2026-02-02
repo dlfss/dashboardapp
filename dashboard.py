@@ -26,7 +26,13 @@ GREEN = "#00E676"   # vivid green
 RED = "#FF1744"     # vivid red
 AMBER = "#FFB300"   # vivid amber
 
-alt.themes.enable("dark")
+# ⚠️ Altair "dark theme" pode variar por versão.
+# Tu já aplicas um "dark look" via configure_* em base_altair_style.
+# Por segurança, tenta ativar o tema, mas não falha se não existir.
+try:
+    alt.themes.enable("dark")
+except Exception:
+    pass
 
 
 # ----------------------------
@@ -89,11 +95,13 @@ st.markdown(
 # Mock data generators
 # ----------------------------
 def _daterange(start: datetime, weeks: int) -> list[datetime]:
+    """Cria uma lista de datas semanais (Date + 7 dias)."""
     return [start + timedelta(days=7 * i) for i in range(weeks)]
 
 
 @st.cache_data(show_spinner=False)
 def make_mock_checks() -> pd.DataFrame:
+    """Gera um DataFrame de checks (mock) no formato semelhante ao Databricks demo."""
     rows = [
         ("Sales_Label_is_null", "error", {"function": "is_not_null", "arguments": {"column": "Sales_Label"}}),
         ("Sales_Label_other_value", "error", {"function": "is_in_list", "arguments": {"column": "Sales_Label", "allowed": ["High", "Medium", "Low"]}}),
@@ -114,11 +122,14 @@ def make_mock_checks() -> pd.DataFrame:
     df = pd.DataFrame(rows, columns=["name", "criticality", "check"])
     df["filter"] = None
     df["run_config_name"] = "default"
+
+    # Guardar o JSON como string (como no dataset real)
     df["check"] = df["check"].apply(lambda x: json.dumps(x))
     return df
 
 
 def _sales_label(v: float, q33: float, q66: float) -> str:
+    """Atribui etiqueta High/Medium/Low a partir de tercis."""
     if v >= q66:
         return "High"
     if v >= q33:
@@ -128,6 +139,11 @@ def _sales_label(v: float, q33: float, q66: float) -> str:
 
 @st.cache_data(show_spinner=False)
 def make_mock_valid_and_quarantine(seed: int = 42) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Gera dados mock estilo Walmart:
+    - valid: ~90%
+    - quarantine: ~10% + __errors/__warnings em JSON
+    """
     rng = np.random.default_rng(seed)
     stores = list(range(1, 46))
     start = datetime(2010, 2, 5)
@@ -137,6 +153,7 @@ def make_mock_valid_and_quarantine(seed: int = 42) -> tuple[pd.DataFrame, pd.Dat
     rows = []
     id_counter = 1
 
+    # Gera séries semanais por store (com sazonalidade simples + feriado)
     for d in dates:
         active_stores = rng.choice(stores, size=rng.integers(25, 46), replace=False)
         for s in active_stores:
@@ -167,6 +184,8 @@ def make_mock_valid_and_quarantine(seed: int = 42) -> tuple[pd.DataFrame, pd.Dat
             id_counter += 1
 
     df = pd.DataFrame(rows)
+
+    # Etiqueta de vendas por tercis (calculado no conjunto total)
     q33, q66 = df["Weekly_Sales"].quantile([0.33, 0.66]).tolist()
     df["Sales_Label"] = df["Weekly_Sales"].apply(lambda v: _sales_label(v, q33, q66))
 
@@ -177,6 +196,7 @@ def make_mock_valid_and_quarantine(seed: int = 42) -> tuple[pd.DataFrame, pd.Dat
     q = df_all.loc[quarantine_idx].copy()
     v = df_all.drop(quarantine_idx).copy()
 
+    # Injeta problemas nos registos em quarentena (erros e warnings em JSON)
     def add_issue(row: pd.Series) -> tuple[dict, dict]:
         errors = []
         warnings = []
@@ -223,20 +243,40 @@ def make_mock_valid_and_quarantine(seed: int = 42) -> tuple[pd.DataFrame, pd.Dat
     q["__errors"] = q_errors
     q["__warnings"] = q_warnings
 
+    # valid não tem issues
     v["__errors"] = None
     v["__warnings"] = None
 
     return v.reset_index(drop=True), q.reset_index(drop=True)
 
 
+def _normalize_dates_inplace(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normaliza coluna Date uma vez (evita reconverter em apply_filters repetidamente).
+    Retorna o próprio df para facilitar encadeamento.
+    """
+    if "Date" in df.columns:
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    return df
+
+
 def load_data(mode: str):
+    """
+    Carrega checks + valid + quarantine.
+    - Em 'databricks', tenta Spark (tabelas demo)
+    - Se falhar, cai para mock (sem crash)
+    """
     checks = make_mock_checks()
     valid_df, quarantine_df = make_mock_valid_and_quarantine()
 
     if mode == "mock":
+        # ✅ normaliza Date já aqui
+        _normalize_dates_inplace(valid_df)
+        _normalize_dates_inplace(quarantine_df)
         return checks, valid_df, quarantine_df
 
     try:
+        # Databricks / Spark
         from pyspark.sql import SparkSession  # type: ignore
         spark = SparkSession.getActiveSession()
         if spark is None:
@@ -245,9 +285,16 @@ def load_data(mode: str):
         checks = spark.table("databricks_demos.sales_data.dqx_demo_walmart_checks").toPandas()
         valid_df = spark.table("databricks_demos.sales_data.dqx_demo_walmart_valid_data").toPandas()
         quarantine_df = spark.table("databricks_demos.sales_data.dqx_demo_walmart_quarantine_data").toPandas()
+
+        # ✅ normaliza Date já aqui
+        _normalize_dates_inplace(valid_df)
+        _normalize_dates_inplace(quarantine_df)
+
         return checks, valid_df, quarantine_df
     except Exception:
-        # fallback sem crash
+        # fallback sem crash (mantém mock)
+        _normalize_dates_inplace(valid_df)
+        _normalize_dates_inplace(quarantine_df)
         return checks, valid_df, quarantine_df
 
 
@@ -255,8 +302,18 @@ def load_data(mode: str):
 # Helpers
 # ----------------------------
 def apply_filters(df: pd.DataFrame, start_date, end_date, selected_stores) -> pd.DataFrame:
+    """
+    Filtra por:
+    - intervalo de datas
+    - stores opcionais
+    NOTA: assumimos que Date já é datetime (normalizado no load_data()).
+    """
     dff = df.copy()
-    dff["Date"] = pd.to_datetime(dff["Date"], errors="coerce")
+
+    # Garantia extra: se Date não estiver datetime por algum motivo, converte (seguro).
+    if "Date" in dff.columns and not np.issubdtype(dff["Date"].dtype, np.datetime64):
+        dff["Date"] = pd.to_datetime(dff["Date"], errors="coerce")
+
     dff = dff[(dff["Date"].dt.date >= start_date) & (dff["Date"].dt.date <= end_date)]
     if selected_stores:
         dff = dff[dff["Store"].isin(selected_stores)]
@@ -264,6 +321,11 @@ def apply_filters(df: pd.DataFrame, start_date, end_date, selected_stores) -> pd
 
 
 def parse_issue_counts(series: pd.Series) -> pd.DataFrame:
+    """
+    Recebe uma coluna (__errors ou __warnings) com JSON string:
+      {"items":[{"name":"...", ...}, ...]}
+    e devolve tabela: Regra / Ocorrências.
+    """
     counts = {}
     for x in series.dropna():
         try:
@@ -272,7 +334,9 @@ def parse_issue_counts(series: pd.Series) -> pd.DataFrame:
                 name = item.get("name", "unknown")
                 counts[name] = counts.get(name, 0) + 1
         except Exception:
+            # Se vier lixo (string malformada), ignora
             continue
+
     df = pd.DataFrame({"Regra": list(counts.keys()), "Ocorrências": list(counts.values())})
     if len(df):
         df = df.sort_values("Ocorrências", ascending=False).reset_index(drop=True)
@@ -280,6 +344,7 @@ def parse_issue_counts(series: pd.Series) -> pd.DataFrame:
 
 
 def kpi_card(label: str, value: str, delta: str | None = None, color: str | None = None):
+    """Render de KPI em HTML (cards compactos e legíveis)."""
     color_style = f"color: {color};" if color else ""
     delta_html = f'<div class="delta">{delta}</div>' if delta else ""
     st.markdown(
@@ -295,6 +360,10 @@ def kpi_card(label: str, value: str, delta: str | None = None, color: str | None
 
 
 def base_altair_style(chart):
+    """
+    Estilo consistente "dark" sem depender 100% do theme do Altair.
+    Isto dá robustez entre versões e mantém o look moderno.
+    """
     return (
         chart.configure_view(strokeOpacity=0)
         .configure_axis(
@@ -311,10 +380,10 @@ def base_altair_style(chart):
 # ----------------------------
 def zone_bins(df: pd.DataFrame, xcol: str, set_label: str) -> pd.DataFrame:
     """
-    Zonas Baixa/Média/Alta com fallback.
+    Zonas Baixa/Média/Alta com fallback robusto.
     - Tenta qcut (tercis).
     - Se falhar, usa bins por quantis simples.
-    - Não bloqueia com len(d)<50 (para não "matar" o Valid com filtros).
+    - Não bloqueia em datasets pequenos (para não "matar" o Valid com filtros).
     """
     if len(df) == 0 or xcol not in df.columns or "Weekly_Sales" not in df.columns:
         return pd.DataFrame(columns=["Zona", "AvgSales", "Set"])
@@ -324,6 +393,7 @@ def zone_bins(df: pd.DataFrame, xcol: str, set_label: str) -> pd.DataFrame:
     d["Weekly_Sales"] = pd.to_numeric(d["Weekly_Sales"], errors="coerce")
     d = d.dropna()
 
+    # Se for demasiado pequeno, não inventa
     if len(d) < 5:
         return pd.DataFrame(columns=["Zona", "AvgSales", "Set"])
 
@@ -350,6 +420,8 @@ def zone_bins(df: pd.DataFrame, xcol: str, set_label: str) -> pd.DataFrame:
     g = d.groupby("Zona", as_index=False)["Weekly_Sales"].mean()
     g = g.rename(columns={"Weekly_Sales": "AvgSales"})
     g["Set"] = set_label
+
+    # Ordenação controlada (evita reordenação aleatória)
     g["Zona"] = pd.Categorical(g["Zona"], categories=["Baixa", "Média", "Alta"], ordered=True)
     g["Set"] = pd.Categorical(g["Set"], categories=["Valid", "Quarantine"], ordered=True)
     return g
@@ -358,7 +430,8 @@ def zone_bins(df: pd.DataFrame, xcol: str, set_label: str) -> pd.DataFrame:
 def grouped_zone_chart(valid_zone: pd.DataFrame, quar_zone: pd.DataFrame, title: str):
     """
     Gráfico único com barras agrupadas.
-    GARANTE que aparecem sempre as duas séries (Valid/Quarantine) e as 3 zonas.
+    GARANTE que aparecem sempre as duas séries (Valid/Quarantine) e as 3 zonas,
+    mesmo que faltem dados devido aos filtros.
     """
     # Template garante layout/legend sempre consistentes
     template = pd.DataFrame(
@@ -394,6 +467,10 @@ def grouped_zone_chart(valid_zone: pd.DataFrame, quar_zone: pd.DataFrame, title:
 
 
 def grouped_holiday_chart(valid_df: pd.DataFrame, quar_df: pd.DataFrame, title: str):
+    """
+    Comparação por feriado (valid vs quarantine), barras agrupadas.
+    - remove valores inválidos de Holiday_Flag (só 0/1)
+    """
     def holiday_avg(df: pd.DataFrame, set_label: str) -> pd.DataFrame:
         if len(df) == 0:
             return pd.DataFrame(columns=["Holiday", "AvgSales", "Set"])
@@ -401,7 +478,7 @@ def grouped_holiday_chart(valid_df: pd.DataFrame, quar_df: pd.DataFrame, title: 
         d = df.copy()
         d["Holiday_Flag"] = pd.to_numeric(d.get("Holiday_Flag"), errors="coerce")
 
-        # ✅ mantém apenas 0 e 1 (remove inválidos -> some a barra "Outro")
+        # ✅ mantém apenas 0 e 1 (remove inválidos)
         d = d[d["Holiday_Flag"].isin([0, 1])]
 
         if len(d) == 0:
@@ -413,8 +490,10 @@ def grouped_holiday_chart(valid_df: pd.DataFrame, quar_df: pd.DataFrame, title: 
         g["Set"] = set_label
         return g[["Holiday", "AvgSales", "Set"]]
 
-    # ✅ aqui fora da inner function
-    data = pd.concat([holiday_avg(valid_df, "Valid"), holiday_avg(quar_df, "Quarantine")], ignore_index=True)
+    data = pd.concat(
+        [holiday_avg(valid_df, "Valid"), holiday_avg(quar_df, "Quarantine")],
+        ignore_index=True
+    )
 
     if len(data) == 0:
         return (
@@ -431,7 +510,7 @@ def grouped_holiday_chart(valid_df: pd.DataFrame, quar_df: pd.DataFrame, title: 
         alt.Chart(data)
         .mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6)
         .encode(
-            x=alt.X("Holiday:N", title="", sort=["Com feriado", "Sem feriado"]),
+            x=alt.X("Holiday:N", title="", sort=["Sem feriado", "Com feriado"]),
             xOffset=alt.XOffset("Set:N"),
             y=alt.Y("AvgSales:Q", title="Média Weekly Sales"),
             color=alt.Color(
@@ -445,13 +524,29 @@ def grouped_holiday_chart(valid_df: pd.DataFrame, quar_df: pd.DataFrame, title: 
     )
     return base_altair_style(chart)
 
+
 def trend_chart(valid_df: pd.DataFrame, quar_df: pd.DataFrame, title: str):
+    """
+    Trend de Weekly_Sales (soma semanal) comparando:
+    - Valid (linha sólida)
+    - Quarantine (linha tracejada)
+    """
     data = pd.concat([valid_df.assign(Set="Valid"), quar_df.assign(Set="Quarantine")], ignore_index=True)
+
     if len(data) == 0:
-        return alt.Chart(pd.DataFrame({"msg": ["Sem dados"]})).mark_text(size=14).encode(text="msg:N").properties(height=340, title=title)
+        return (
+            alt.Chart(pd.DataFrame({"msg": ["Sem dados"]}))
+            .mark_text(size=14)
+            .encode(text="msg:N")
+            .properties(height=340, title=title)
+        )
 
     data["Date"] = pd.to_datetime(data["Date"], errors="coerce")
-    ts = data.groupby(["Date", "Set"], as_index=False)["Weekly_Sales"].sum().sort_values("Date")
+
+    ts = (
+        data.groupby(["Date", "Set"], as_index=False)["Weekly_Sales"].sum()
+        .sort_values("Date")
+    )
     ts["Set"] = pd.Categorical(ts["Set"], categories=["Valid", "Quarantine"], ordered=True)
 
     chart = (
@@ -465,10 +560,58 @@ def trend_chart(valid_df: pd.DataFrame, quar_df: pd.DataFrame, title: str):
                 scale=alt.Scale(domain=["Valid", "Quarantine"], range=[GREEN, RED]),
                 legend=alt.Legend(title="", orient="bottom"),
             ),
+            # Dash ajuda comparação sem “tapar”
             strokeDash=alt.StrokeDash("Set:N"),
             tooltip=["Date:T", "Set:N", alt.Tooltip("Weekly_Sales:Q", format=",.0f")],
         )
         .properties(height=340, title=title)
+    )
+    return base_altair_style(chart)
+
+
+def top_quarantine_offenders(quar_df: pd.DataFrame, top_n: int = 8) -> pd.DataFrame:
+    """
+    “Top offenders” = Stores com mais registos em quarentena (simples e rápido).
+    Para UI 3-segundos, isto dá um callout excelente.
+    """
+    if len(quar_df) == 0 or "Store" not in quar_df.columns:
+        return pd.DataFrame(columns=["Store", "Quarantine_Registos"])
+
+    d = quar_df.copy()
+    d["Store"] = pd.to_numeric(d["Store"], errors="coerce")
+    d = d.dropna(subset=["Store"])
+
+    out = (
+        d.groupby("Store", as_index=False)
+        .size()
+        .rename(columns={"size": "Quarantine_Registos"})
+        .sort_values("Quarantine_Registos", ascending=False)
+        .head(top_n)
+    )
+    out["Store"] = out["Store"].astype(int)
+    return out
+
+
+def offenders_chart(offenders: pd.DataFrame, title: str):
+    """Bar chart simples para os top offenders (quarantine por store)."""
+    if len(offenders) == 0:
+        return (
+            alt.Chart(pd.DataFrame({"msg": ["Sem dados"]}))
+            .mark_text(size=14)
+            .encode(text="msg:N")
+            .properties(height=260, title=title)
+        )
+
+    chart = (
+        alt.Chart(offenders)
+        .mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6)
+        .encode(
+            x=alt.X("Quarantine_Registos:Q", title=""),
+            y=alt.Y("Store:N", sort="-x", title="Store"),
+            color=alt.value(RED),
+            tooltip=["Store:N", "Quarantine_Registos:Q"],
+        )
+        .properties(height=260, title=title)
     )
     return base_altair_style(chart)
 
@@ -493,13 +636,17 @@ st.markdown(
 st.sidebar.header("⚙️ Controlo")
 data_mode = st.sidebar.radio("Fonte de dados", ["mock", "databricks"], index=0)
 
+# Carrega os datasets (com Date já normalizado)
 checks_df, valid_df, quarantine_df = load_data(data_mode)
 
+# Cria df_all para min/max datas e stores disponíveis
 df_all = pd.concat([valid_df.assign(_set="Valid"), quarantine_df.assign(_set="Quarantine")], ignore_index=True)
-df_all["Date"] = pd.to_datetime(df_all["Date"], errors="coerce")
 
-min_date = df_all["Date"].min().date()
-max_date = df_all["Date"].max().date()
+# Date já é datetime; se por algum motivo vier NaT em tudo, definimos defaults seguros
+min_dt = df_all["Date"].min()
+max_dt = df_all["Date"].max()
+min_date = (min_dt.date() if pd.notna(min_dt) else datetime(2010, 1, 1).date())
+max_date = (max_dt.date() if pd.notna(max_dt) else datetime(2010, 12, 31).date())
 
 date_range = st.sidebar.date_input("Datas", value=(min_date, max_date), min_value=min_date, max_value=max_date)
 if isinstance(date_range, tuple) and len(date_range) == 2:
@@ -513,6 +660,8 @@ selected_stores = st.sidebar.multiselect("Store (opcional)", store_options, defa
 st.sidebar.divider()
 
 # Chat acessível em qualquer tab
+# NOTA: em algumas versões do Streamlit, st.chat_input() no sidebar pode ter quirks.
+# Se algum dia te der chat "bugado", troca por st.text_input + botão.
 show_chat = st.sidebar.toggle("💬 Chat", value=True)
 if "chat_messages" not in st.session_state:
     st.session_state.chat_messages = [{"role": "assistant", "content": "Faz uma pergunta (placeholder IA)."}]
@@ -522,17 +671,20 @@ if show_chat:
         for m in st.session_state.chat_messages:
             with st.chat_message(m["role"]):
                 st.markdown(m["content"])
+
         user_msg = st.chat_input("Escreve aqui…")
         if user_msg:
             st.session_state.chat_messages.append({"role": "user", "content": user_msg})
             with st.chat_message("user"):
                 st.markdown(user_msg)
+
+            # Placeholder: aqui ligas o teu motor (OpenAI/Groq/OpenRouter/etc.)
             reply = "Recebido. (placeholder: aqui ligas o teu motor de IA.)"
             st.session_state.chat_messages.append({"role": "assistant", "content": reply})
             with st.chat_message("assistant"):
                 st.markdown(reply)
 
-# Apply filters
+# Apply filters (já com Date normalizado)
 valid_f = apply_filters(valid_df, start_date, end_date, selected_stores)
 quar_f = apply_filters(quarantine_df, start_date, end_date, selected_stores)
 
@@ -541,7 +693,7 @@ quar_f = apply_filters(quarantine_df, start_date, end_date, selected_stores)
 # Tabs
 # ----------------------------
 tab_overview, tab_sales, tab_quality, tab_insights, tab_checks = st.tabs(
-    ["⚡ Overview", "📈 Vendas", "✅ Qualidade", "🧠 Insights","🧱 Checks (Advanced)"]
+    ["⚡ Overview", "📈 Vendas", "✅ Qualidade", "🧠 Insights", "🧱 Checks (Advanced)"]
 )
 
 
@@ -549,6 +701,7 @@ tab_overview, tab_sales, tab_quality, tab_insights, tab_checks = st.tabs(
 # OVERVIEW
 # ----------------------------
 with tab_overview:
+    # KPIs base
     total_valid = len(valid_f)
     total_quar = len(quar_f)
     total = total_valid + total_quar
@@ -556,8 +709,8 @@ with tab_overview:
     pct_valid = (total_valid / total * 100) if total else 0
     pct_quar = (total_quar / total * 100) if total else 0
 
-    total_sales_valid = float(pd.to_numeric(valid_f["Weekly_Sales"], errors="coerce").sum()) if total_valid else 0.0
-    total_sales_quar = float(pd.to_numeric(quar_f["Weekly_Sales"], errors="coerce").sum()) if total_quar else 0.0
+    total_sales_valid = float(pd.to_numeric(valid_f.get("Weekly_Sales", pd.Series(dtype=float)), errors="coerce").sum()) if total_valid else 0.0
+    total_sales_quar = float(pd.to_numeric(quar_f.get("Weekly_Sales", pd.Series(dtype=float)), errors="coerce").sum()) if total_quar else 0.0
 
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
@@ -573,6 +726,7 @@ with tab_overview:
 
     st.markdown("")
 
+    # Linha 1: donut + trend
     left, right = st.columns([1, 1])
 
     donut_df = pd.DataFrame({"Status": ["Valid", "Quarantine"], "Count": [total_valid, total_quar]})
@@ -594,6 +748,11 @@ with tab_overview:
 
     right.altair_chart(trend_chart(valid_f, quar_f, "Vendas semanais (Valid vs Quarantine)"), use_container_width=True)
 
+    # Linha 2: “Top offenders” (3 segundos)
+    st.markdown("")
+    offenders = top_quarantine_offenders(quar_f, top_n=8)
+    st.altair_chart(offenders_chart(offenders, "Top Stores em Quarantine (registos)"), use_container_width=True)
+
 
 # ----------------------------
 # VENDAS
@@ -607,6 +766,7 @@ with tab_sales:
     else:
         colA, colB = st.columns([1.2, 1])
 
+        # Top Stores (Valid)
         with colA:
             if len(valid_f):
                 top = (
@@ -630,8 +790,12 @@ with tab_sales:
             else:
                 st.info("Sem dados Valid.")
 
+        # Holiday comparison (Valid vs Quarantine)
         with colB:
-            st.altair_chart(grouped_holiday_chart(valid_f, quar_f, "Feriado: média de vendas (Valid vs Quarantine)"), use_container_width=True)
+            st.altair_chart(
+                grouped_holiday_chart(valid_f, quar_f, "Feriado: média de vendas (Valid vs Quarantine)"),
+                use_container_width=True
+            )
 
 
 # ----------------------------
@@ -644,6 +808,7 @@ with tab_quality:
     if len(quar_f) == 0:
         st.success("Nada em quarentena para estes filtros.")
     else:
+        # Contagem de regras (todas)
         err_df = parse_issue_counts(quar_f.get("__errors", pd.Series(dtype="object")))
         warn_df = parse_issue_counts(quar_f.get("__warnings", pd.Series(dtype="object")))
 
@@ -686,6 +851,11 @@ with tab_quality:
             else:
                 st.info("Sem warnings parseáveis.")
 
+        # Mini bloco extra: offenders no tab Qualidade também (opcional mas útil)
+        st.markdown("### 🧯 Top offenders (Quarantine por Store)")
+        offenders = top_quarantine_offenders(quar_f, top_n=10)
+        st.altair_chart(offenders_chart(offenders, "Stores com mais registos em Quarantine"), use_container_width=True)
+
         st.markdown("### 📋 Exemplos em Quarantine")
         show_cols = ["Store", "Date", "Weekly_Sales", "Holiday_Flag", "Temperature", "Fuel_Price", "CPI", "Unemployment", "Sales_Label", "__errors", "__warnings"]
         present_cols = [c for c in show_cols if c in quar_f.columns]
@@ -702,23 +872,25 @@ with tab_insights:
     if len(valid_f) == 0 and len(quar_f) == 0:
         st.warning("Sem dados para estes filtros.")
     else:
+        # Temperature
         v = zone_bins(valid_f, "Temperature", "Valid")
         q = zone_bins(quar_f, "Temperature", "Quarantine")
         st.altair_chart(grouped_zone_chart(v, q, "Vendas vs Temperatura (zonas)"), use_container_width=True)
 
+        # Fuel_Price
         v = zone_bins(valid_f, "Fuel_Price", "Valid")
         q = zone_bins(quar_f, "Fuel_Price", "Quarantine")
         st.altair_chart(grouped_zone_chart(v, q, "Vendas vs Preço do Combustível (zonas)"), use_container_width=True)
 
+        # Unemployment
         v = zone_bins(valid_f, "Unemployment", "Valid")
         q = zone_bins(quar_f, "Unemployment", "Quarantine")
         st.altair_chart(grouped_zone_chart(v, q, "Vendas vs Unemployment (zonas)"), use_container_width=True)
 
+        # CPI
         v = zone_bins(valid_f, "CPI", "Valid")
         q = zone_bins(quar_f, "CPI", "Quarantine")
         st.altair_chart(grouped_zone_chart(v, q, "Vendas vs CPI (zonas)"), use_container_width=True)
-
-
 
 
 # ----------------------------
