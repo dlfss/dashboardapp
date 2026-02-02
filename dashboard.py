@@ -525,7 +525,7 @@ quar_f = apply_filters(quarantine_df, start_date, end_date, selected_stores)
 # ----------------------------
 # Tabs
 # ----------------------------
-tab_overview, tab_sales, tab_quality, tab_insights, tab_chat, tab_checks = st.tabs(
+tab_overview, tab_sales, tab_quality, tab_insights, tab_checks = st.tabs(
     ["⚡ Overview", "📈 Vendas", "✅ Qualidade", "🧠 Insights","🧱 Checks (Advanced)"]
 )
 
