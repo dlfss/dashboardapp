@@ -394,32 +394,44 @@ def grouped_zone_chart(valid_zone: pd.DataFrame, quar_zone: pd.DataFrame, title:
 
 
 def grouped_holiday_chart(valid_df: pd.DataFrame, quar_df: pd.DataFrame, title: str):
-  def holiday_avg(df: pd.DataFrame, set_label: str) -> pd.DataFrame:
-    if len(df) == 0:
-        return pd.DataFrame(columns=["Holiday", "AvgSales", "Set"])
+    def holiday_avg(df: pd.DataFrame, set_label: str) -> pd.DataFrame:
+        if len(df) == 0:
+            return pd.DataFrame(columns=["Holiday", "AvgSales", "Set"])
 
-    d = df.copy()
-    d["Holiday_Flag"] = pd.to_numeric(d.get("Holiday_Flag"), errors="coerce")
+        d = df.copy()
+        d["Holiday_Flag"] = pd.to_numeric(d.get("Holiday_Flag"), errors="coerce")
 
-    # ✅ mantém apenas 0 e 1 (remove inválidos -> some a barra "Outro")
-    d = d[d["Holiday_Flag"].isin([0, 1])]
+        # ✅ mantém apenas 0 e 1 (remove inválidos -> some a barra "Outro")
+        d = d[d["Holiday_Flag"].isin([0, 1])]
 
-    if len(d) == 0:
-        return pd.DataFrame(columns=["Holiday", "AvgSales", "Set"])
+        if len(d) == 0:
+            return pd.DataFrame(columns=["Holiday", "AvgSales", "Set"])
 
-    g = d.groupby("Holiday_Flag", as_index=False)["Weekly_Sales"].mean()
-    g["Holiday"] = g["Holiday_Flag"].map({0: "Sem feriado", 1: "Com feriado"})
-    g = g.rename(columns={"Weekly_Sales": "AvgSales"})
-    g["Set"] = set_label
-    return g[["Holiday", "AvgSales", "Set"]]
+        g = d.groupby("Holiday_Flag", as_index=False)["Weekly_Sales"].mean()
+        g["Holiday"] = g["Holiday_Flag"].map({0: "Sem feriado", 1: "Com feriado"})
+        g = g.rename(columns={"Weekly_Sales": "AvgSales"})
+        g["Set"] = set_label
+        return g[["Holiday", "AvgSales", "Set"]]
 
+    # ✅ aqui fora da inner function
+    data = pd.concat([holiday_avg(valid_df, "Valid"), holiday_avg(quar_df, "Quarantine")], ignore_index=True)
+
+    if len(data) == 0:
+        return (
+            alt.Chart(pd.DataFrame({"msg": ["Sem dados"]}))
+            .mark_text(size=14)
+            .encode(text="msg:N")
+            .properties(height=360, title=title)
+        )
+
+    # garante ordem na legenda
     data["Set"] = pd.Categorical(data["Set"], categories=["Valid", "Quarantine"], ordered=True)
 
     chart = (
         alt.Chart(data)
         .mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6)
         .encode(
-            x=alt.X("Holiday:N", title=""),
+            x=alt.X("Holiday:N", title="", sort=["Com feriado", "Sem feriado"]),
             xOffset=alt.XOffset("Set:N"),
             y=alt.Y("AvgSales:Q", title="Média Weekly Sales"),
             color=alt.Color(
@@ -432,7 +444,6 @@ def grouped_holiday_chart(valid_df: pd.DataFrame, quar_df: pd.DataFrame, title: 
         .properties(height=360, title=title)
     )
     return base_altair_style(chart)
-
 
 def trend_chart(valid_df: pd.DataFrame, quar_df: pd.DataFrame, title: str):
     data = pd.concat([valid_df.assign(Set="Valid"), quar_df.assign(Set="Quarantine")], ignore_index=True)
