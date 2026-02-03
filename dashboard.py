@@ -1,6 +1,6 @@
 # app.py
 # =============================================================================
-# DQ Sales Monitor
+# DQ Sales Monitor — Versão Final com Insights em Containers
 # =============================================================================
 
 import json
@@ -103,7 +103,6 @@ def make_mock_valid_and_quarantine(seed: int = 42) -> tuple[pd.DataFrame, pd.Dat
 
     df = pd.DataFrame(rows)
     
-    # Criar Quarentena (15%)
     quarantine_idx = rng.choice(df.index, size=int(len(df) * 0.15), replace=False)
     q = df.loc[quarantine_idx].copy()
     v = df.drop(quarantine_idx).copy()
@@ -178,7 +177,7 @@ tab_over, tab_sales, tab_qual, tab_ins, tab_check = st.tabs(
 )
 
 # -----------------------------------------------------------------------------
-# TAB 1: OVERVIEW (Inalterada na lógica)
+# TAB 1: OVERVIEW (Inalterada)
 # -----------------------------------------------------------------------------
 with tab_over:
     n_val, n_quar = len(valid_f), len(quar_f)
@@ -206,7 +205,7 @@ with tab_over:
         st.altair_chart(base_altair(c), use_container_width=True)
 
 # -----------------------------------------------------------------------------
-# TAB 2: VENDAS (Inalterada na lógica)
+# TAB 2: VENDAS (Inalterada)
 # -----------------------------------------------------------------------------
 with tab_sales:
     st.subheader("Performance de Vendas")
@@ -223,7 +222,7 @@ with tab_sales:
         st.warning("Sem dados válidos para mostrar.")
 
 # -----------------------------------------------------------------------------
-# TAB 3: QUALIDADE (Inalterada na lógica)
+# TAB 3: QUALIDADE (Inalterada)
 # -----------------------------------------------------------------------------
 with tab_qual:
     st.subheader("Análise de Erros")
@@ -244,7 +243,7 @@ with tab_qual:
             st.success("Nenhum registo em quarentena!")
 
 # -----------------------------------------------------------------------------
-# TAB 4: INSIGHTS (ALTERADA PARA USAR O TEU EXEMPLO)
+# TAB 4: INSIGHTS (ALTERADA COM O TEU ESTILO E LOGICA)
 # -----------------------------------------------------------------------------
 with tab_ins:
     st.markdown("### 🧠 Insights de Dados")
@@ -252,62 +251,76 @@ with tab_ins:
     if valid_f.empty and quar_f.empty:
         st.warning("Sem dados.")
     else:
-        # Função para criar o gráfico com estilo limpo
-        def container_chart(v_df, q_df, col, step, x_label):
-            # 1. Juntar dados
-            v = v_df[[col, "Weekly_Sales"]].copy(); v["Status"] = "Valid"
-            q = q_df[[col, "Weekly_Sales"]].copy(); q["Status"] = "Quarantine"
-            df = pd.concat([v, q], ignore_index=True)
-            
-            # 2. Criar Intervalos (Bins)
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-            df = df.dropna(subset=[col])
-            # Arredondar para o step mais próximo
-            df["Intervalo"] = (np.floor(df[col] / step) * step).round(2)
-            
-            # 3. Agrupar
-            grouped = df.groupby(["Intervalo", "Status"], as_index=False)["Weekly_Sales"].mean()
-            
-            # 4. Gráfico Altair (Mantemos Altair para forçar o Verde e Vermelho)
-            chart = alt.Chart(grouped).mark_bar(cornerRadius=4).encode(
-                x=alt.X("Intervalo:O", title=None), # Eixo X sem título para limpar
-                xOffset="Status", # Barras lado a lado
-                y=alt.Y("Weekly_Sales", title=None, axis=None), # Removemos Eixo Y
-                color=alt.Color("Status", scale=alt.Scale(domain=["Valid", "Quarantine"], range=[GREEN, RED]), legend=None),
-                tooltip=["Intervalo", "Status", alt.Tooltip("Weekly_Sales", format=",.0f")]
-            ).properties(height=180) # Altura reduzida para caber bem no container
-            
-            # Renderizar dentro do container como pediste
+        # Função genérica para criar o gráfico e colocar dentro do container
+        def render_insight_container(v_df, q_df, col, title, is_categorical=False, step=1.0):
             with st.container(border=True):
-                st.markdown(f"**{x_label}**")
+                st.markdown(f"**{title}**")
+                
+                # 1. Preparar dados
+                v = v_df[[col, "Weekly_Sales"]].copy(); v["Status"] = "Valid"
+                q = q_df[[col, "Weekly_Sales"]].copy(); q["Status"] = "Quarantine"
+                df = pd.concat([v, q], ignore_index=True)
+                
+                # 2. Criar Eixo X
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+                df = df.dropna(subset=[col])
+
+                sort_order = None
+                if is_categorical:
+                    # Lógica de Zonas para Temperatura (Baixa/Média/Alta)
+                    q33, q66 = df[col].quantile([0.33, 0.66])
+                    def get_zone(x): return "Baixa" if x <= q33 else ("Média" if x <= q66 else "Alta")
+                    df["Eixo_X"] = df[col].apply(get_zone)
+                    sort_order = ["Baixa", "Média", "Alta"]
+                else:
+                    # Lógica Numérica para os outros (Bins)
+                    df["Eixo_X"] = (np.floor(df[col] / step) * step).round(2)
+                
+                # 3. Agrupar
+                grouped = df.groupby(["Eixo_X", "Status"], as_index=False)["Weekly_Sales"].mean()
+                
+                # 4. Gráfico
+                chart = alt.Chart(grouped).mark_bar(cornerRadius=4).encode(
+                    x=alt.X("Eixo_X", title=None, sort=sort_order),
+                    xOffset="Status",
+                    y=alt.Y("Weekly_Sales", title=None, axis=None),
+                    color=alt.Color("Status", scale=alt.Scale(domain=["Valid", "Quarantine"], range=[GREEN, RED]), legend=None),
+                    tooltip=["Eixo_X", "Status", alt.Tooltip("Weekly_Sales", format=",.0f")]
+                ).properties(height=200) # Altura controlada dentro do container
+
                 st.altair_chart(base_altair(chart), use_container_width=True)
 
-        # Layout em Grelha (2 colunas)
+        # Layout Grelha
         c1, c2 = st.columns(2)
+        
         with c1:
-            # Temperatura agora com intervalos de 5 em 5 (igual aos outros)
-            container_chart(valid_f, quar_f, "Temperature", 5.0, "🌡️ Temperatura (Intervalos de 5°)")
+            # Temperatura: Categórica (Baixa/Média/Alta)
+            render_insight_container(valid_f, quar_f, "Temperature", "🌡️ Temperatura (Zonas)", is_categorical=True)
             
         with c2:
-            container_chart(valid_f, quar_f, "Fuel_Price", 0.5, "⛽ Preço Combustível (Intervalos de $0.5)")
+            # Combustível: Numérico (Passo 0.5)
+            render_insight_container(valid_f, quar_f, "Fuel_Price", "⛽ Combustível (Intervalos $0.5)", is_categorical=False, step=0.5)
             
         c3, c4 = st.columns(2)
+        
         with c3:
-            container_chart(valid_f, quar_f, "Unemployment", 1.0, "💼 Desemprego (Intervalos de 1%)")
+            # Desemprego: Numérico (Passo 1.0)
+            render_insight_container(valid_f, quar_f, "Unemployment", "💼 Desemprego (Intervalos 1%)", is_categorical=False, step=1.0)
             
         with c4:
-            container_chart(valid_f, quar_f, "CPI", 10.0, "💰 CPI (Intervalos de 10)")
+            # CPI: Numérico (Passo 10.0)
+            render_insight_container(valid_f, quar_f, "CPI", "💰 CPI (Intervalos 10)", is_categorical=False, step=10.0)
             
-        # Pequena legenda no fundo
+        # Legenda simples
         st.markdown(
-            f"""<div style="text-align:center; opacity:0.6; font-size:0.8rem; margin-top:10px;">
+            f"""<div style="text-align:center; opacity:0.6; font-size:0.8rem; margin-top:5px;">
                 <span style="color:{GREEN}">■</span> Valid &nbsp;&nbsp;&nbsp; 
                 <span style="color:{RED}">■</span> Quarantine
             </div>""", unsafe_allow_html=True
         )
 
 # -----------------------------------------------------------------------------
-# TAB 5: CHECKS (Inalterada na lógica)
+# TAB 5: CHECKS (Inalterada)
 # -----------------------------------------------------------------------------
 with tab_check:
     st.subheader("Definição de Regras")
