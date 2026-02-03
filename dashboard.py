@@ -893,30 +893,66 @@ with tab_quality:
 
 
 # =============================================================================
-# 14) INSIGHTS (bins em 3 zonas)
+# 14) INSIGHTS (Atualizado com Containers, Tabs e Rolling Average)
 # =============================================================================
 with tab_insights:
-    st.subheader("🧠 Insights")
-    st.caption("Zonas Baixa / Média / Alta — barras lado a lado (Valid vs Quarantine).")
+    st.subheader("🧠 Insights Dinâmicos")
+    st.caption("Análise de correlação com média móvel opcional e visualização em abas.")
 
     if len(valid_f) == 0 and len(quar_f) == 0:
         st.warning("Sem dados para estes filtros.")
     else:
-        v = zone_bins(valid_f, "Temperature", "Valid")
-        q = zone_bins(quar_f, "Temperature", "Quarantine")
-        st.altair_chart(grouped_zone_chart(v, q, "Vendas vs Temperatura (zonas)"), use_container_width=True)
+        # Criamos um container com borda para os controlos, como na imagem
+        with st.container(border=True):
+            col_sel, col_tog = st.columns([2, 1])
+            with col_sel:
+                # Permite escolher qual métrica analisar
+                metrics = ["Temperature", "Fuel_Price", "Unemployment", "CPI"]
+                selected_metric = st.selectbox("Selecione a Métrica Base", metrics)
+            with col_tog:
+                st.write("") # Alinhamento
+                use_rolling = st.toggle("Média Móvel (Janela: 7)", value=False)
 
-        v = zone_bins(valid_f, "Fuel_Price", "Valid")
-        q = zone_bins(quar_f, "Fuel_Price", "Quarantine")
-        st.altair_chart(grouped_zone_chart(v, q, "Vendas vs Preço do Combustível (zonas)"), use_container_width=True)
+        # Processamento dos dados para o gráfico de linhas
+        def get_line_data(df, metric, label):
+            if df.empty: return pd.DataFrame()
+            # Agrupamos por data para ter uma linha temporal
+            d = df.groupby("Date")[[metric, "Weekly_Sales"]].mean().reset_index()
+            d["Set"] = label
+            return d
 
-        v = zone_bins(valid_f, "Unemployment", "Valid")
-        q = zone_bins(quar_f, "Unemployment", "Quarantine")
-        st.altair_chart(grouped_zone_chart(v, q, "Vendas vs Unemployment (zonas)"), use_container_width=True)
+        v_line = get_line_data(valid_f, selected_metric, "Valid")
+        q_line = get_line_data(quar_f, selected_metric, "Quarantine")
+        combined_line = pd.concat([v_line, q_line])
 
-        v = zone_bins(valid_f, "CPI", "Valid")
-        q = zone_bins(quar_f, "CPI", "Quarantine")
-        st.altair_chart(grouped_zone_chart(v, q, "Vendas vs CPI (zonas)"), use_container_width=True)
+        if not combined_line.empty:
+            # Aplicação da Média Móvel se o toggle estiver ativo
+            if use_rolling:
+                combined_line = combined_line.sort_values("Date")
+                combined_line["Weekly_Sales"] = combined_line.groupby("Set")["Weekly_Sales"].transform(lambda x: x.rolling(7).mean())
+                combined_line = combined_line.dropna(subset=["Weekly_Sales"])
+
+            # Criação das Tabs internas (Chart / Dataframe) como solicitado
+            t_chart, t_data = st.tabs(["📊 Gráfico de Tendência", "📑 Dados Brutos"])
+
+            with t_chart:
+                line_chart = (
+                    alt.Chart(combined_line)
+                    .mark_line(interpolate='monotone', strokeWidth=3)
+                    .encode(
+                        x=alt.X("Date:T", title="Data"),
+                        y=alt.Y("Weekly_Sales:Q", title="Vendas (Média)"),
+                        color=alt.Color("Set:N", scale=alt.Scale(domain=["Valid", "Quarantine"], range=[GREEN, RED])),
+                        tooltip=["Date", "Set", "Weekly_Sales", selected_metric]
+                    )
+                    .properties(height=400)
+                )
+                st.altair_chart(base_altair_style(line_chart), use_container_width=True)
+
+            with t_data:
+                st.dataframe(combined_line, use_container_width=True, hide_index=True)
+        else:
+            st.info("Dados insuficientes para gerar a tendência temporal.")
 
 
 # =============================================================================
